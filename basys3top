@@ -1,0 +1,273 @@
+`default_nettype none
+
+module basys3_top (
+    input  wire        clk,      // 100 MHz clock from Basys 3
+    input  wire        btnC,     // Center button for Reset
+    output reg  [15:0] led,      // 16 LEDs to display status
+    input  wire        RsRx,     // UART Receive Pin
+    output wire        RsTx      // UART Transmit Pin
+);
+
+    // =========================================================
+    // 1. CLOCK & RESET
+    // =========================================================
+    reg clk_50 = 0;
+    always @(posedge clk) clk_50 <= ~clk_50;
+
+    // Synchronize async reset (btnC)
+    reg [1:0] sync_rst;
+    always @(posedge clk_50) sync_rst <= {sync_rst[0], btnC};
+    wire reset_n = ~sync_rst[1]; 
+
+    // =========================================================
+    // 2. UART RECEIVER
+    // =========================================================
+    wire       rx_dv;
+    wire [7:0] rx_byte;
+    
+    uart_rx my_uart_rx (
+        .clk(clk_50),
+        .rx_serial(RsRx),
+        .rx_dv(rx_dv),
+        .rx_byte(rx_byte)
+    );
+
+    // =========================================================
+    // 3. MULTI-BLOCK STREAMING BUFFER & FSM
+    // =========================================================
+    reg [511:0] current_block;
+    reg [63:0]  total_bit_count; // 64 bits to store total message length
+    reg [5:0]   byte_index;      // 0 to 63 (position in the current block)
+    
+    // FSM States
+    localparam S_IDLE          = 0;
+    localparam S_FILL          = 1;
+    localparam S_PROCESS_CHUNK = 2;
+    localparam S_PAD           = 3;
+    localparam S_PAD_SPILL     = 4; 
+    localparam S_WAIT_FINAL    = 5;
+    localparam S_WAIT_READY    = 6; // NEW: Waits for core to become busy, then finish
+    
+    reg [2:0] fsm_state;
+    reg is_first_block;
+    reg start_hash;
+    reg next_hash;
+    reg hash_finished;
+
+    always @(posedge clk_50 or negedge reset_n) begin
+        if (!reset_n) begin
+            fsm_state <= S_IDLE;
+            current_block <= 0;
+            total_bit_count <= 0;
+            byte_index <= 0;
+            start_hash <= 0;
+            next_hash <= 0;
+            is_first_block <= 1;
+            hash_finished <= 0;
+            led <= 0;
+        end else begin
+            start_hash <= 0; // Default off (pulse)
+            next_hash <= 0;  // Default off (pulse)
+            hash_finished <= 0;
+            
+            case (fsm_state)
+                S_IDLE: begin
+                    is_first_block <= 1;
+                    total_bit_count <= 0;
+                    byte_index <= 0;
+                    current_block <= 0;
+                    if (rx_dv && rx_byte != 8'h0A && rx_byte != 8'h0D) begin
+                        // Load first byte and start filling
+                        current_block <= {current_block[503:0], rx_byte};
+                        byte_index <= 1;
+                        total_bit_count <= 8;
+                        led <= 1;
+                        fsm_state <= S_FILL;
+                    end
+                end
+                
+                S_FILL: begin
+                    if (rx_dv) begin
+                        if (rx_byte == 8'h0A || rx_byte == 8'h0D) begin
+                            // Enter key pressed -> Move to padding phase
+                            fsm_state <= S_PAD;
+                        end else begin
+                            // Shift in new byte
+                            current_block <= {current_block[503:0], rx_byte};
+                            byte_index <= byte_index + 1;
+                            total_bit_count <= total_bit_count + 8;
+                            led <= led + 1; 
+                            
+                            // If block is exactly 64 bytes (512 bits) full
+                            if (byte_index == 63) begin
+                                fsm_state <= S_PROCESS_CHUNK;
+                            end
+                        end
+                    end
+                end
+                
+                S_PROCESS_CHUNK: begin
+                    // Wait for the SHA core to be ready to process this full chunk
+                    if (ready) begin
+                        if (is_first_block) start_hash <= 1;
+                        else                next_hash <= 1;
+                        
+                        is_first_block <= 0;
+                        byte_index <= 0;
+                        fsm_state <= S_FILL; // Go back to filling the next block
+                    end
+                end
+                
+                S_PAD: begin
+                    if (ready) begin
+                        if (byte_index > 55) begin
+                            // SPILLOVER: Not enough room for 0x80 AND the 64-bit length.
+                            // Align to MSB, append 0x80, pad the rest with zeros.
+                            current_block <= (current_block << (512 - byte_index*8)) | 
+                                             (512'h80 << (512 - byte_index*8 - 8));
+                            
+                            if (is_first_block) start_hash <= 1;
+                            else                next_hash <= 1;
+                            
+                            is_first_block <= 0;
+                            fsm_state <= S_PAD_SPILL;
+                        end else begin
+                            // NORMAL: Plenty of room. Align to MSB, append 0x80, zeros, and length at the end.
+                            current_block <= (current_block << (512 - byte_index*8)) | 
+                                             (512'h80 << (512 - byte_index*8 - 8)) | 
+                                             total_bit_count;
+                                             
+                            if (is_first_block) start_hash <= 1;
+                            else                next_hash <= 1;
+                            
+                            fsm_state <= S_WAIT_FINAL;
+                        end
+                    end
+                end
+                
+                S_PAD_SPILL: begin
+                    if (ready) begin
+                        // Send the final spillover block: ALL ZEROS and the 64-bit length at the end
+                        current_block <= { 448'b0, total_bit_count };
+                        next_hash <= 1;
+                        fsm_state <= S_WAIT_FINAL; 
+                    end
+                end
+                
+                S_WAIT_FINAL: begin
+                    // The core takes 1 clock cycle to pull 'ready' low after a command.
+                    // We must wait for it to acknowledge the command and start computing.
+                    if (!ready) begin
+                        fsm_state <= S_WAIT_READY;
+                    end
+                end
+                
+                S_WAIT_READY: begin
+                    // Now we wait for the core to actually finish the computation
+                    if (ready && digest_valid) begin
+                        hash_finished <= 1;  // Trigger the UART transmitter!
+                        fsm_state <= S_IDLE; // Reset for the next word
+                    end
+                end
+            endcase
+        end
+    end
+
+    // =========================================================
+    // 4. SHA-256 CRYPTOGRAPHIC CORE
+    // =========================================================
+    wire ready;
+    wire [255:0] digest;
+    wire digest_valid;
+
+    sha256_core core_inst (
+        .clk(clk_50),         
+        .reset_n(reset_n),
+        .init(start_hash),
+        .next(next_hash),          
+        .mode(1'b1),          
+        .block(current_block),     
+        .ready(ready),
+        .digest(digest),
+        .digest_valid(digest_valid)
+    );
+
+    // =========================================================
+    // 5. UART TRANSMITTER (Sending result back to PC)
+    // =========================================================
+    wire uart_tx_active, uart_tx_done;
+    reg        uart_tx_start = 0;
+    reg  [7:0] uart_tx_data  = 0;
+
+    uart_tx my_uart_tx (
+        .clk(clk_50), 
+        .tx_start(uart_tx_start), 
+        .tx_data(uart_tx_data),
+        .tx_active(uart_tx_active), 
+        .tx_serial(RsTx), 
+        .tx_done(uart_tx_done)
+    );
+
+    // Helper function to convert 4-bit hex to printable ASCII character
+    function [7:0] hex2ascii(input [3:0] hex_val);
+        if (hex_val <= 9) hex2ascii = hex_val + 8'h30;
+        else              hex2ascii = hex_val + 8'h37;
+    endfunction
+
+    // State machine to send 64 hex characters + \r + \n
+    reg [255:0] shift_digest;
+    reg [6:0]   send_count = 0;
+    reg [2:0]   send_state = 0;
+
+    always @(posedge clk_50 or negedge reset_n) begin
+        if (!reset_n) begin
+            send_state <= 0; uart_tx_start <= 0; send_count <= 0;
+        end else begin
+            case (send_state)
+                0: begin 
+                    uart_tx_start <= 0;
+                    // Trigger ONLY when the FSM signals the final block is completely finished
+                    if (hash_finished) begin
+                        shift_digest <= digest;
+                        send_count <= 65; // 64 chars + CR + LF
+                        send_state <= 1;
+                    end
+                end
+                
+                1: begin
+                    if (!uart_tx_active && !uart_tx_start) begin
+                        if (send_count > 1) 
+                            uart_tx_data <= hex2ascii(shift_digest[255:252]);
+                        else if (send_count == 1) 
+                            uart_tx_data <= 8'h0D; // \r
+                        else if (send_count == 0) 
+                            uart_tx_data <= 8'h0A; // \n
+                            
+                        uart_tx_start <= 1; 
+                        send_state <= 2;
+                    end
+                end
+                
+                2: begin
+                    if (uart_tx_active) begin 
+                        uart_tx_start <= 0; 
+                        send_state <= 3; 
+                    end
+                end
+                
+                3: begin
+                    if (uart_tx_done) begin
+                        if (send_count > 0) begin
+                            if (send_count > 1) 
+                                shift_digest <= {shift_digest[251:0], 4'h0}; 
+                            send_count <= send_count - 1; 
+                            send_state <= 1;
+                        end else begin
+                            send_state <= 0;
+                        end
+                    end
+                end
+            endcase
+        end
+    end
+endmodule
