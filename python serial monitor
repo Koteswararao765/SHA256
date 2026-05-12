@@ -1,0 +1,53 @@
+import serial
+import time
+
+# Change this to match your COM port (e.g., 'COM3')
+COM_PORT = 'COM3' 
+BAUD_RATE = 115200
+
+def main():
+    print("==================================================")
+    print(" Basys 3 SHA-256 Multi-Block Input Monitor")
+    print("==================================================\n")
+    
+    try:
+        with serial.Serial(COM_PORT, BAUD_RATE, timeout=5) as ser:
+            print("✅ Connected successfully!\n")
+            
+            while True:
+                # Ask user for input (No artificial limits!)
+                user_input = input("Enter text to hash (any length) or 'q' to quit: ")
+                
+                if user_input.lower() == 'q':
+                    break
+                
+                if len(user_input) == 0:
+                    continue
+                
+                # Send the string plus a newline character (\n) to trigger the FPGA
+                message = user_input + '\n'
+                
+                # We encode to ascii.
+                ser.write(message.encode('ascii', errors='ignore'))
+                print(f">> Sent {len(user_input)} characters to FPGA...")
+                
+                # Wait for the FPGA to compute and reply
+                start_time = time.time()
+                while time.time() - start_time < 5: # 5 second timeout for massive strings
+                    if ser.in_waiting > 0:
+                        raw_data = ser.readline()
+                        try:
+                            hash_str = raw_data.decode('ascii').strip()
+                            if len(hash_str) == 64:
+                                print(f"🚀 FPGA Computed SHA-256: {hash_str}\n")
+                                break
+                        except Exception as e:
+                            print(f"Decode error: {e}")
+                            pass
+
+    except serial.SerialException as e:
+         print(f"\n❌ Port Error: {e}")
+         print("Make sure Vivado Hardware Manager is closed!")
+
+if __name__ == '__main__':
+    main()
